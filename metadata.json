@@ -1,0 +1,6 @@
+{
+  "name": "SubCraft Studio",
+  "description": "Offline-first Smart Audio Studio (VoiceLab DSP, Noise Print, Silence Removal, Multi-Format Audio Export) & Subtitle Timeline, Auto-Translation, Glossary, and Video Burn-In Studio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

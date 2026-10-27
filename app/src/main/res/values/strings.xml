@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">SubCraft Studio</string>
+    <string name="nav_record">রেকর্ড ও ব্যাচ</string>
+    <string name="nav_editor">অডিও এডিটর</string>
+    <string name="nav_subtitles">সাবটাইটেল এডিটর</string>
+    <string name="nav_video">ভিডিও বার্ন-ইন</string>
+    <string name="nav_hub">গ্লোসারি ও হাব</string>
+    <string name="save_audio_format">অডিও সেভ ও এক্সপোর্ট</string>
+    <string name="export_srt">SRT এক্সপোর্ট</string>
+    <string name="export_txt">TXT এক্সপোর্ট</string>
+    <string name="export_mp4">MP4 ভিডিও বার্ন-ইন</string>
+</resources>
