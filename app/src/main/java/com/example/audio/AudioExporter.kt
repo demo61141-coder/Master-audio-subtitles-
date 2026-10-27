@@ -19,6 +19,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.math.max
@@ -101,7 +102,8 @@ object AudioExporter {
     ): File = withContext(Dispatchers.IO) {
         val safeName = baseName.replace(Regex("[^a-zA-Z0-9\\u0980-\\u09FF_-]"), "_").ifBlank { "subcraft_audio" }
         val outDir = File(context.filesDir, "exports").apply { mkdirs() }
-        val outFile = File(outDir, "${safeName}_${System.currentTimeMillis() % 100000}.${format.extension}")
+        val fileName = "${safeName}_${System.currentTimeMillis() % 100000}.${format.extension}"
+        val outFile = File(outDir, fileName)
 
         when (format) {
             AudioExportFormat.WAV_16 -> {
@@ -119,10 +121,19 @@ object AudioExporter {
                     encodeAacM4a(samples, sampleRate, outFile)
                 }.getOrDefault(false)
                 if (!encodedOk) {
-                    // Fallback to WAV container if hardware AAC codec is unavailable in unit test environment
                     FileOutputStream(outFile).use { it.write(encodeWavBytes(samples, sampleRate, 16)) }
                 }
             }
+        }
+
+        // Also copy to public Downloads/SubCraftStudio so the user can find it immediately in their device's Files app
+        runCatching {
+            SubtitleEngine.saveBytesToPublicDownloads(
+                context = context,
+                fileName = fileName,
+                mimeType = format.mimeType,
+                bytes = outFile.readBytes()
+            )
         }
         outFile
     }
@@ -217,7 +228,8 @@ object AudioExporter {
     ): File = withContext(Dispatchers.IO) {
         val safeName = baseName.replace(Regex("[^a-zA-Z0-9\\u0980-\\u09FF_-]"), "_").ifBlank { "chunks" }
         val outDir = File(context.filesDir, "exports").apply { mkdirs() }
-        val zipFile = File(outDir, "${safeName}_chunks_${ranges.size}.zip")
+        val fileName = "${safeName}_chunks_${ranges.size}.zip"
+        val zipFile = File(outDir, fileName)
         ZipOutputStream(FileOutputStream(zipFile)).use { zos ->
             ranges.take(100).forEachIndexed { idx, r ->
                 val slice = AudioDspEngine.extractRange(samples, sampleRate, r, 4)
@@ -227,6 +239,14 @@ object AudioExporter {
                 zos.write(wavBytes)
                 zos.closeEntry()
             }
+        }
+        runCatching {
+            SubtitleEngine.saveBytesToPublicDownloads(
+                context = context,
+                fileName = fileName,
+                mimeType = "application/zip",
+                bytes = zipFile.readBytes()
+            )
         }
         zipFile
     }
@@ -243,11 +263,7 @@ object AudioExporter {
         }
     }
 
-    /**
-     * Decodes WAV or compressed audio URI (MP3/M4A/OGG/MP4) into mono FloatArray PCM.
-     */
     suspend fun decodeAudioUri(context: Context, uri: Uri): Pair<FloatArray, Int>? = withContext(Dispatchers.IO) {
-        // First try fast WAV header parse
         runCatching {
             context.contentResolver.openInputStream(uri)?.use { stream ->
                 val bytes = stream.readBytes()
@@ -257,7 +273,6 @@ object AudioExporter {
             }
         }
 
-        // Fallback to Android MediaExtractor + MediaCodec for MP3 / M4A / OGG / MP4 video audio track
         runCatching {
             val extractor = MediaExtractor()
             context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
@@ -316,6 +331,8 @@ object AudioExporter {
                     if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                         isEOS = true
                     }
+                } else if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER && extractor.sampleTime < 0) {
+                    isEOS = true
                 }
             }
             codec.stop()
@@ -374,15 +391,26 @@ object AudioExporter {
 }
 
 /**
- * Low-latency PCM audio player with playhead tracking, range selection playback, and looping.
+ * Low-latency PCM audio player with live seeking while playing, range selection playback, and looping.
  */
 class PcmSamplePlayer {
     private var track: AudioTrack? = null
+    private val pendingSeekSample = AtomicInteger(-1)
+    private var currentSampleRate = 44100
+
     @Volatile var isPlaying: Boolean = false
         private set
 
+    fun seekWhilePlaying(sec: Float) {
+        if (isPlaying && currentSampleRate > 0) {
+            val targetIdx = (sec * currentSampleRate).roundToInt().coerceAtLeast(0)
+            pendingSeekSample.set(targetIdx)
+        }
+    }
+
     fun stop() {
         isPlaying = false
+        pendingSeekSample.set(-1)
         runCatching {
             track?.pause()
             track?.flush()
@@ -405,6 +433,7 @@ class PcmSamplePlayer {
             onComplete()
             return@withContext
         }
+        currentSampleRate = sampleRate
         val startIdx = (startSec * sampleRate).roundToInt().coerceIn(0, samples.lastIndex)
         val endIdx = (endSec * sampleRate).roundToInt().coerceIn(startIdx + 1, samples.size)
         val minBuf = AudioTrack.getMinBufferSize(
@@ -442,7 +471,12 @@ class PcmSamplePlayer {
             do {
                 var cursor = startIdx
                 while (isPlaying && cursor < endIdx) {
+                    val requestedSeek = pendingSeekSample.getAndSet(-1)
+                    if (requestedSeek >= 0) {
+                        cursor = requestedSeek.coerceIn(0, samples.lastIndex)
+                    }
                     val count = min(chunkFrames, endIdx - cursor)
+                    if (count <= 0) break
                     for (i in 0 until count) {
                         val v = samples[cursor + i].coerceIn(-1f, 1f)
                         pcm16[i] = (v * 32767f).toInt().coerceIn(-32768, 32767).toShort()

@@ -1,5 +1,9 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -17,6 +21,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -26,14 +31,21 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.AutoFixHigh
+import androidx.compose.material.icons.filled.CallMerge
 import androidx.compose.material.icons.filled.CallSplit
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.EditNote
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material.icons.filled.Subtitles
-import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.UploadFile
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -45,7 +57,12 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -54,12 +71,16 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.example.audio.AudioDspEngine
 import com.example.audio.SubtitleBlock
 import com.example.audio.SupportedLanguage
@@ -68,6 +89,7 @@ import com.example.ui.components.StudioPanel
 import com.example.ui.components.StudioToggleRow
 import com.example.ui.theme.Ink700
 import com.example.ui.theme.Ink800
+import com.example.ui.theme.Ink850
 import com.example.ui.theme.Ink900
 import com.example.ui.theme.Ink950
 import com.example.ui.theme.JetBrainsMonoFontFamily
@@ -85,7 +107,6 @@ import com.example.viewmodel.StudioViewModel
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -93,9 +114,27 @@ fun SubtitleTimelineScreen(
     uiState: StudioUiState,
     viewModel: StudioViewModel
 ) {
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+
+    val dictationPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        viewModel.toggleLiveVoiceDictation()
+    }
+
+    val importSubFileLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.importSubtitleFileUri(uri)
+        }
+    }
+
     val activeSub = uiState.subtitles.firstOrNull {
         uiState.playheadSec >= it.startSec && uiState.playheadSec <= it.endSec
     } ?: uiState.subtitles.firstOrNull { it.id == uiState.selectedSubtitleId }
+        ?: uiState.subtitles.firstOrNull()
 
     Column(
         modifier = Modifier
@@ -145,20 +184,29 @@ fun SubtitleTimelineScreen(
                             )
                         }
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = activeSub?.originalText ?: "অডিও প্লে করুন বা নিচের যেকোনো সাবটাইটেল ব্লকে ট্যাপ করুন…",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = Sand50,
-                            textAlign = TextAlign.Center
-                        )
-                        if (activeSub != null && activeSub.translatedText.isNotBlank()) {
-                            Spacer(modifier = Modifier.height(4.dp))
+                        if (uiState.isLiveDictating && uiState.liveDictationPartial.isNotBlank()) {
                             Text(
-                                text = activeSub.translatedText,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = TealAccent,
+                                text = "🎙️ ${uiState.liveDictationPartial}",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = LimeAccent,
                                 textAlign = TextAlign.Center
                             )
+                        } else {
+                            Text(
+                                text = activeSub?.originalText ?: "অডিও প্লে করুন বা নিচের যেকোনো সাবটাইটেল ব্লকে ট্যাপ করুন…",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = Sand50,
+                                textAlign = TextAlign.Center
+                            )
+                            if (activeSub != null && activeSub.translatedText.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = activeSub.translatedText,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = TealAccent,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
                         }
                     }
                 }
@@ -177,7 +225,7 @@ fun SubtitleTimelineScreen(
                     }
                 )
 
-                // Player & Global Time-Shift Row
+                // Player & Global Timeline Actions Row
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -216,6 +264,15 @@ fun SubtitleTimelineScreen(
                         Text("+0.25s শিফট", color = Sand300)
                     }
                     OutlinedButton(
+                        onClick = { viewModel.autoFixSubtitleTimeline() },
+                        border = BorderStroke(1.dp, LimeAccent.copy(alpha = 0.7f)),
+                        modifier = Modifier.testTag("autofix_timeline_button")
+                    ) {
+                        Icon(Icons.Default.AutoFixHigh, contentDescription = null, tint = LimeAccent, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("ওভারল্যাপ ফিক্স", color = LimeAccent)
+                    }
+                    OutlinedButton(
                         onClick = { viewModel.addNewSubtitleBlock() },
                         border = BorderStroke(1.dp, TealAccent),
                         modifier = Modifier.testTag("add_subtitle_block_button")
@@ -228,16 +285,16 @@ fun SubtitleTimelineScreen(
             }
         }
 
-        // Panel 2: Multi-Language Speech-to-Text & 1-Click Direct Auto-Translation (Feature 4)
+        // Panel 2: Multi-Language Speech-to-Text, Live Dictation, Script Sync & Auto-Translation (Feature 4)
         StudioPanel(
-            title = "মাল্টি-ল্যাঙ্গুয়েজ ট্রান্সক্রিপশন ও অটো-ট্রান্সলেশন",
+            title = "ট্রান্সক্রিপশন, ভয়েস ডিক্টেশন ও অটো-ট্রান্সলেশন",
             step = "FEAT 4",
-            subtitle = "অডিওর ভাষা নির্বাচন করে ট্রান্সক্রাইব করুন এবং ১ ক্লিকে যেকোনো ভাষায় সাবটাইটেল অনুবাদ ও .SRT/.TXT এক্সপোর্ট করুন",
+            subtitle = "অডিও ট্রান্সক্রাইব, মাইকে সরাসরি ভয়েস ডিক্টেশন, স্ক্রিপ্ট অটো-সিঙ্ক এবং ১-ক্লিক অনুবাদ ও এক্সপোর্ট",
             accentColor = TealAccent
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    text = "১. অডিও ইনপুট ভাষা (Audio Input Language):",
+                    text = "১. অডিও ও ভয়েস ইনপুট ভাষা (Audio / Dictation Language):",
                     style = MaterialTheme.typography.labelMedium,
                     color = Sand300
                 )
@@ -266,17 +323,70 @@ fun SubtitleTimelineScreen(
                     }
                 }
 
-                Button(
-                    onClick = { viewModel.runSpeechToSubtitles() },
-                    colors = ButtonDefaults.buttonColors(containerColor = SignalOrange, contentColor = Ink950),
-                    modifier = Modifier.fillMaxWidth().testTag("transcribe_audio_button")
+                // 3 Subtitle Input Modes Row: Auto-Transcribe, Live Mic Dictation, Script Auto-Sync
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        "${uiState.sourceLanguage.nativeName} অডিও থেকে সাবটাইটেল ও টাইমস্ট্যাম্প জেনারেট করুন",
-                        fontWeight = FontWeight.Bold
-                    )
+                    Button(
+                        onClick = { viewModel.runSpeechToSubtitles() },
+                        colors = ButtonDefaults.buttonColors(containerColor = SignalOrange, contentColor = Ink950),
+                        modifier = Modifier.testTag("transcribe_audio_button")
+                    ) {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("অটো ট্রান্সক্রাইব", fontWeight = FontWeight.Bold)
+                    }
+
+                    Button(
+                        onClick = {
+                            val granted = ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.RECORD_AUDIO
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (granted) {
+                                viewModel.toggleLiveVoiceDictation()
+                            } else {
+                                dictationPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (uiState.isLiveDictating) RecRed else TealAccent,
+                            contentColor = Ink950
+                        ),
+                        modifier = Modifier.testTag("live_dictation_button")
+                    ) {
+                        Icon(
+                            if (uiState.isLiveDictating) Icons.Default.Stop else Icons.Default.Mic,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            if (uiState.isLiveDictating) "ডিক্টেশন থামান" else "ভয়েস ডিক্টেশন",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = { viewModel.setShowScriptSyncDialog(true) },
+                        border = BorderStroke(1.dp, LimeAccent),
+                        modifier = Modifier.testTag("open_script_sync_button")
+                    ) {
+                        Icon(Icons.Default.EditNote, contentDescription = null, tint = LimeAccent, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("স্ক্রিপ্ট অটো-সিঙ্ক", color = LimeAccent, fontWeight = FontWeight.SemiBold)
+                    }
+
+                    OutlinedButton(
+                        onClick = { importSubFileLauncher.launch("text/*") },
+                        border = BorderStroke(1.dp, Ink700)
+                    ) {
+                        Icon(Icons.Default.UploadFile, contentDescription = null, tint = Sand100, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("SRT/TXT ইম্পোর্ট", color = Sand100)
+                    }
                 }
 
                 Text(
@@ -312,7 +422,7 @@ fun SubtitleTimelineScreen(
 
                 StudioToggleRow(
                     label = "ডুয়াল সাবটাইটেল মোড (Bilingual Original + Translated)",
-                    hint = "SRT/TXT এবং ভিডিও প্রিভিউতে মূল ও অনূদিত দুই ভাষাই একসাথে দেখাবে",
+                    hint = "SRT/VTT/TXT এবং ভিডিও প্রিভিউতে মূল ও অনূদিত দুই ভাষাই একসাথে দেখাবে",
                     checked = uiState.subtitleStyle.bilingualDualSub,
                     onCheckedChange = {
                         viewModel.updateSubtitleStyle(uiState.subtitleStyle.copy(bilingualDualSub = it))
@@ -320,7 +430,7 @@ fun SubtitleTimelineScreen(
                     accent = TealAccent
                 )
 
-                // Export SRT & TXT Row
+                // Export SRT, VTT & TXT Row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -331,8 +441,17 @@ fun SubtitleTimelineScreen(
                         modifier = Modifier.weight(1f).testTag("export_srt_button")
                     ) {
                         Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(".SRT এক্সপোর্ট", fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(".SRT সেভ", fontWeight = FontWeight.Bold)
+                    }
+                    Button(
+                        onClick = { viewModel.exportSubtitles("vtt") },
+                        colors = ButtonDefaults.buttonColors(containerColor = SignalOrange, contentColor = Ink950),
+                        modifier = Modifier.weight(1f).testTag("export_vtt_button")
+                    ) {
+                        Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(".VTT সেভ", fontWeight = FontWeight.Bold)
                     }
                     Button(
                         onClick = { viewModel.exportSubtitles("txt") },
@@ -340,8 +459,8 @@ fun SubtitleTimelineScreen(
                         modifier = Modifier.weight(1f).testTag("export_txt_button")
                     ) {
                         Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(".TXT এক্সপোর্ট", fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(".TXT সেভ", fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -351,7 +470,7 @@ fun SubtitleTimelineScreen(
         StudioPanel(
             title = "ইন-অ্যাপ সাবটাইটেল ব্লক এডিটর (Click to Edit & Trim)",
             step = "BLOCKS",
-            subtitle = "যেকোনো ব্লকে ক্লিক করে টেক্সট সংশোধন, শুরু/শেষ টাইমস্ট্যাম্প ট্রিম (+/- 0.1s) কিংবা স্প্লিট করুন",
+            subtitle = "যেকোনো ব্লকে ট্যাপ করে টেক্সট সংশোধন, শুরু/শেষ টাইমস্ট্যাম্প ট্রিম (+/- 0.1s), স্প্লিট বা মার্জ করুন",
             accentColor = SignalOrange
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -373,12 +492,138 @@ fun SubtitleTimelineScreen(
                             )
                         },
                         onSplit = { viewModel.splitSelectedSubtitleBlock(block.id) },
+                        onMergeNext = { viewModel.mergeSubtitleWithNext(block.id) },
                         onDelete = { viewModel.deleteSubtitleBlock(block.id) }
                     )
                 }
             }
         }
         Spacer(modifier = Modifier.height(16.dp))
+    }
+
+    // Script Auto-Sync Dialog
+    if (uiState.showScriptSyncDialog) {
+        var scriptText by remember {
+            mutableStateOf(
+                "স্বাগতম আমাদের আজকের পডকাস্ট পর্বে।\n" +
+                    "VoiceLab আমাদের অডিওর ব্যাকগ্রাউন্ড নয়েজ পরিষ্কার করেছে।\n" +
+                    "SubCraft AI Studio দিয়ে আমরা অটো টাইমস্ট্যাম্প তৈরি করছি।\n" +
+                    "এখন এক ক্লিকে যেকোনো ভাষায় সাবটাইটেল অনুবাদ ও এক্সপোর্ট করুন।"
+            )
+        }
+        AlertDialog(
+            onDismissRequest = { viewModel.setShowScriptSyncDialog(false) },
+            containerColor = Ink850,
+            titleContentColor = Sand50,
+            textContentColor = Sand100,
+            title = {
+                Text("স্ক্রিপ্ট / লিরিক্স অটো-সিঙ্ক (Auto Timestamp Sync)", style = MaterialTheme.typography.titleMedium)
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "প্রতি লাইনে একটি করে বাক্য বা ডায়ালগ লিখুন। ইঞ্জিন অডিও ওয়েভফর্মের ভয়েস সেগমেন্টের সাথে স্বয়ংক্রিয়ভাবে টাইমস্ট্যাম্প মিলিয়ে দেবে:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Sand300
+                    )
+                    OutlinedTextField(
+                        value = scriptText,
+                        onValueChange = { scriptText = it },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(160.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = TealAccent,
+                            unfocusedBorderColor = Ink700
+                        )
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = { viewModel.syncCustomScriptToSubtitles(scriptText) },
+                    colors = ButtonDefaults.buttonColors(containerColor = TealAccent, contentColor = Ink950)
+                ) {
+                    Text("অডিওর সাথে সিঙ্ক করুন", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.setShowScriptSyncDialog(false) }) {
+                    Text("বাতিল", color = Sand300)
+                }
+            }
+        )
+    }
+
+    // Exported Subtitle Preview & Copy Dialog
+    if (uiState.exportedSubtitlePreviewContent != null) {
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissSubtitlePreviewDialog() },
+            containerColor = Ink850,
+            titleContentColor = Sand50,
+            textContentColor = Sand100,
+            title = {
+                Text(
+                    text = uiState.exportedSubtitlePreviewTitle ?: "এক্সপোর্টকৃত সাবটাইটেল",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = TealAccent
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "ফাইলটি ফোনের Downloads/SubCraftStudio ফোল্ডারে সেভ হয়েছে। নিচে প্রিভিউ দেখুন বা কপি/শেয়ার করুন:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Sand300
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 120.dp, max = 260.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Ink950)
+                            .border(1.dp, Ink700, RoundedCornerShape(8.dp))
+                            .padding(10.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        Text(
+                            text = uiState.exportedSubtitlePreviewContent,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontSize = 11.sp,
+                            color = Sand50
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(uiState.exportedSubtitlePreviewContent))
+                            viewModel.dismissSubtitlePreviewDialog()
+                        },
+                        border = BorderStroke(1.dp, TealAccent)
+                    ) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = null, tint = TealAccent, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("কপি করুন", color = TealAccent)
+                    }
+                    Button(
+                        onClick = { viewModel.sharePreviewedSubtitleFile() },
+                        colors = ButtonDefaults.buttonColors(containerColor = SignalOrange, contentColor = Ink950)
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("শেয়ার", fontWeight = FontWeight.Bold)
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.dismissSubtitlePreviewDialog() }) {
+                    Text("বন্ধ করুন", color = Sand300)
+                }
+            }
+        )
     }
 }
 
@@ -496,6 +741,7 @@ private fun SubtitleBlockEditorCard(
     onTextChange: (String, String) -> Unit,
     onTimestampNudge: (Float, Float) -> Unit,
     onSplit: () -> Unit,
+    onMergeNext: () -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
@@ -516,7 +762,7 @@ private fun SubtitleBlockEditorCard(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Top bar: index, timestamps, glossary badges, play/split/delete
+            // Top bar: index, timestamps, glossary badges, play/split/merge/delete
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -546,6 +792,9 @@ private fun SubtitleBlockEditorCard(
                     IconButton(onClick = onSplit, modifier = Modifier.size(32.dp)) {
                         Icon(Icons.Default.CallSplit, contentDescription = "Split subtitle", tint = SignalOrange)
                     }
+                    IconButton(onClick = onMergeNext, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Default.CallMerge, contentDescription = "Merge with next", tint = LimeAccent)
+                    }
                     IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
                         Icon(Icons.Default.DeleteOutline, contentDescription = "Delete subtitle", tint = RecRed)
                     }
@@ -564,11 +813,10 @@ private fun SubtitleBlockEditorCard(
             }
 
             if (isSelected) {
-                // Editable TextFields + Timestamp Trim controls when selected
                 OutlinedTextField(
                     value = block.originalText,
                     onValueChange = { onTextChange(it, block.translatedText) },
-                    label = { Text("মূল সাবটাইটেল টেক্সট (Original)") },
+                    label = { Text("মূল সাবটাইটেল টেক্সট (Original — অটো অনুবাদ হবে)") },
                     modifier = Modifier.fillMaxWidth(),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = SignalOrange,

@@ -214,6 +214,31 @@ fun AudioEditorAndEffectsScreen(
                     ) {
                         Text("ফিট (${AudioDspEngine.formatTimecode(uiState.analysis.durationSec)})", color = Sand300)
                     }
+                    OutlinedButton(
+                        onClick = { viewModel.trimToSelection() },
+                        border = BorderStroke(1.dp, TealAccent.copy(alpha = 0.7f)),
+                        modifier = Modifier.testTag("editor_trim_selection_button")
+                    ) {
+                        Icon(Icons.Default.ContentCut, contentDescription = null, tint = TealAccent, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("সিলেকশন ট্রিম", color = TealAccent)
+                    }
+                    OutlinedButton(
+                        onClick = { viewModel.deleteSelectedAudioRange() },
+                        border = BorderStroke(1.dp, RecRed.copy(alpha = 0.7f)),
+                        modifier = Modifier.testTag("editor_delete_selection_button")
+                    ) {
+                        Icon(Icons.Default.DeleteOutline, contentDescription = null, tint = RecRed, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("সিলেকশন ডিলিট", color = RecRed)
+                    }
+                    OutlinedButton(
+                        onClick = { viewModel.applyFadeInOutToAudio() },
+                        border = BorderStroke(1.dp, LimeAccent.copy(alpha = 0.7f)),
+                        modifier = Modifier.testTag("editor_fade_button")
+                    ) {
+                        Text("ফেড ইন/আউট", color = LimeAccent)
+                    }
                 }
 
                 // Loudness & Signal Metrics Row

@@ -6,7 +6,6 @@ import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.hypot
-import kotlin.math.ln
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
@@ -258,6 +257,97 @@ object AudioDspEngine {
         return values to (hop.toFloat() / sampleRate)
     }
 
+    /**
+     * Adaptive Voice Activity Detection (VAD) that finds spoken phrase segments in any audio buffer.
+     * Automatically adapts to the file's noise floor and splits overly long segments (> 4.2s) at quiet dips.
+     */
+    fun detectVoiceActivitySegments(
+        samples: FloatArray,
+        sampleRate: Int,
+        maxSegmentSec: Float = 4.2f
+    ): List<TimeRange> {
+        if (samples.isEmpty() || sampleRate <= 0) return emptyList()
+        val totalSec = samples.size.toFloat() / sampleRate
+        if (totalSec <= 0.2f) return listOf(TimeRange(0f, totalSec))
+
+        val (env, hopSec) = envelopeDb(samples, sampleRate, 20)
+        val sorted = env.filter { it > -120f }.sorted()
+        val p15 = if (sorted.isNotEmpty()) sorted[(sorted.size * 0.15).toInt()] else -50f
+        val p85 = if (sorted.isNotEmpty()) sorted[(sorted.size * 0.85).toInt()] else -20f
+        val adaptiveThreshold = (p15 + (p85 - p15) * 0.28f).coerceIn(-48f, -24f)
+
+        val rawRanges = mutableListOf<TimeRange>()
+        var startIdx = -1
+        var silenceRun = 0
+        val minSilenceHops = max(1, (0.28f / hopSec).roundToInt())
+
+        for (i in env.indices) {
+            val active = env[i] >= adaptiveThreshold
+            if (active) {
+                if (startIdx < 0) startIdx = max(0, i - 2)
+                silenceRun = 0
+            } else if (startIdx >= 0) {
+                silenceRun++
+                if (silenceRun >= minSilenceHops) {
+                    val endIdx = max(startIdx + 1, i - silenceRun + 2)
+                    val s = (startIdx * hopSec).coerceIn(0f, totalSec)
+                    val e = (endIdx * hopSec).coerceIn(s, totalSec)
+                    if (e - s >= 0.45f) {
+                        rawRanges.add(TimeRange(s, e))
+                    }
+                    startIdx = -1
+                    silenceRun = 0
+                }
+            }
+        }
+        if (startIdx >= 0) {
+            val s = (startIdx * hopSec).coerceIn(0f, totalSec)
+            if (totalSec - s >= 0.4f) {
+                rawRanges.add(TimeRange(s, totalSec))
+            }
+        }
+
+        // Subdivide any long segment (> maxSegmentSec) at local energy minima
+        val finalRanges = mutableListOf<TimeRange>()
+        for (r in rawRanges) {
+            if (r.duration <= maxSegmentSec) {
+                finalRanges.add(r)
+            } else {
+                var curStart = r.start
+                while (r.end - curStart > maxSegmentSec) {
+                    val searchFrom = curStart + maxSegmentSec * 0.6f
+                    val searchTo = min(r.end - 0.5f, curStart + maxSegmentSec)
+                    val h0 = (searchFrom / hopSec).toInt().coerceIn(0, env.lastIndex)
+                    val h1 = (searchTo / hopSec).toInt().coerceIn(h0, env.lastIndex)
+                    var minHop = h1
+                    var minVal = Float.POSITIVE_INFINITY
+                    for (h in h0..h1) {
+                        if (env[h] < minVal) {
+                            minVal = env[h]
+                            minHop = h
+                        }
+                    }
+                    val splitAt = (minHop * hopSec).coerceIn(curStart + 1.0f, r.end)
+                    finalRanges.add(TimeRange(curStart, splitAt))
+                    curStart = splitAt + 0.06f
+                }
+                if (r.end - curStart >= 0.4f) {
+                    finalRanges.add(TimeRange(curStart, r.end))
+                }
+            }
+        }
+
+        if (finalRanges.isEmpty()) {
+            var cur = 0.15f
+            while (cur < totalSec - 0.25f) {
+                val end = min(totalSec - 0.05f, cur + 3.0f)
+                finalRanges.add(TimeRange(cur, end))
+                cur = end + 0.2f
+            }
+        }
+        return finalRanges
+    }
+
     fun learnNoiseProfile(
         rawSamples: FloatArray,
         sampleRate: Int,
@@ -459,6 +549,35 @@ object AudioDspEngine {
         return out
     }
 
+    fun deleteRange(
+        samples: FloatArray,
+        sampleRate: Int,
+        rangeToRemove: TimeRange
+    ): FloatArray {
+        val totalSec = samples.size.toFloat() / sampleRate
+        val kept = invertRanges(listOf(rangeToRemove), totalSec)
+        return if (kept.isEmpty()) samples else keepRanges(samples, sampleRate, kept, 8)
+    }
+
+    fun applyFadeInOut(
+        samples: FloatArray,
+        sampleRate: Int,
+        fadeInSec: Float = 0.4f,
+        fadeOutSec: Float = 0.4f
+    ): FloatArray {
+        if (samples.isEmpty()) return samples
+        val out = samples.copyOf()
+        val inSamples = min(out.size / 2, (fadeInSec * sampleRate).roundToInt())
+        val outSamples = min(out.size / 2, (fadeOutSec * sampleRate).roundToInt())
+        for (i in 0 until inSamples) {
+            out[i] *= (i.toFloat() / max(1, inSamples))
+        }
+        for (i in 0 until outSamples) {
+            out[out.lastIndex - i] *= (i.toFloat() / max(1, outSamples))
+        }
+        return out
+    }
+
     fun removeSilence(
         samples: FloatArray,
         sampleRate: Int,
@@ -581,9 +700,6 @@ object AudioDspEngine {
         return if (peakDb(limited) > -1f) normalizePeak(limited, -1f) else limited
     }
 
-    /**
-     * Full Studio Biquad EQ + De-Esser + Dynamics Compressor + Limiter chain in pure Kotlin DSP.
-     */
     fun renderEnhanced(
         samples: FloatArray,
         sampleRate: Int,
@@ -591,27 +707,20 @@ object AudioDspEngine {
     ): FloatArray {
         if (samples.isEmpty()) return samples
         var buf = samples.copyOf()
-        // 1. Highpass filter
         buf = applyBiquad(buf, sampleRate, BiquadType.HIGHPASS, cfg.highpassHz, 0.707f, 0f)
-        // 2. Lowpass filter
         buf = applyBiquad(buf, sampleRate, BiquadType.LOWPASS, cfg.lowpassHz, 0.707f, 0f)
-        // 3. Warmth low-shelf
         if (abs(cfg.warmthGainDb) > 0.05f) {
             buf = applyBiquad(buf, sampleRate, BiquadType.LOWSHELF, cfg.warmthHz, 0.707f, cfg.warmthGainDb)
         }
-        // 4. Presence peaking
         if (abs(cfg.presenceGainDb) > 0.05f) {
             buf = applyBiquad(buf, sampleRate, BiquadType.PEAKING, cfg.presenceHz, cfg.presenceQ, cfg.presenceGainDb)
         }
-        // 5. De-Esser peaking cut
         if (abs(cfg.deEsserGainDb) > 0.05f) {
             buf = applyBiquad(buf, sampleRate, BiquadType.PEAKING, cfg.deEsserHz, cfg.deEsserQ, cfg.deEsserGainDb)
         }
-        // 6. Air high-shelf
         if (abs(cfg.airGainDb) > 0.05f) {
             buf = applyBiquad(buf, sampleRate, BiquadType.HIGHSHELF, cfg.airHz, 0.707f, cfg.airGainDb)
         }
-        // 7. Dynamics Compressor + Makeup Gain + Limiter Drive
         val threshLin = dbToLin(cfg.compThresholdDb)
         val ratio = max(1f, cfg.compRatio)
         val attackCoef = kotlin.math.exp(-1.0 / (max(0.001f, cfg.compAttack) * sampleRate)).toFloat()
@@ -753,9 +862,6 @@ object AudioDspEngine {
         )
     }
 
-    /**
-     * Generates realistic multi-phrase speech with formant harmonics, room fan noise, and pauses.
-     */
     fun generateDemoAudio(
         seconds: Int = 20,
         sampleRate: Int = 44100,
@@ -844,5 +950,15 @@ object AudioDspEngine {
         val secs = (totalMs % 60000) / 1000
         val ms = totalMs % 1000
         return "%02d:%02d:%02d,%03d".format(hrs, mins, secs, ms)
+    }
+
+    fun formatVttTimestamp(sec: Float): String {
+        val safe = if (sec.isFinite() && sec > 0f) sec else 0f
+        val totalMs = (safe * 1000f).roundToInt()
+        val hrs = totalMs / 3600000
+        val mins = (totalMs % 3600000) / 60000
+        val secs = (totalMs % 60000) / 1000
+        val ms = totalMs % 1000
+        return "%02d:%02d:%02d.%03d".format(hrs, mins, secs, ms)
     }
 }

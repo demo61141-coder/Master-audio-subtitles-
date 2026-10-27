@@ -52,9 +52,6 @@ data class SubtitleStyleConfig(
 
 object VideoBurnInExporter {
 
-    /**
-     * Extracts a representative video thumbnail frame if the user uploaded a custom background video.
-     */
     suspend fun extractVideoBackdrop(context: Context, videoUri: Uri): Bitmap? = withContext(Dispatchers.IO) {
         runCatching {
             val retriever = MediaMetadataRetriever()
@@ -150,8 +147,10 @@ object VideoBurnInExporter {
             }
         }
 
-        // Find active subtitle block for current timeSec
+        // Find active subtitle block for current timeSec (or fall back to nearest block if paused at 0s)
         val active = subtitles.firstOrNull { timeSec >= it.startSec && timeSec <= it.endSec }
+            ?: if (timeSec < 0.15f) subtitles.firstOrNull() else null
+
         if (active != null) {
             val primaryText = if (style.showTranslated && active.translatedText.isNotBlank()) {
                 active.translatedText
@@ -161,7 +160,7 @@ object VideoBurnInExporter {
             val secondaryText = if (style.bilingualDualSub && active.translatedText.isNotBlank() &&
                 active.translatedText != active.originalText
             ) {
-                active.originalText
+                if (style.showTranslated) active.originalText else active.translatedText
             } else {
                 null
             }
@@ -181,7 +180,7 @@ object VideoBurnInExporter {
                 this.textAlign = Paint.Align.CENTER
             }
 
-            val lines = wrapText(primaryText, textPaint, width * 0.82f).toMutableList()
+            val lines = wrapText(primaryText, textPaint, width * 0.82f)
             val subLines = if (secondaryText != null) {
                 wrapText(secondaryText, textPaint, width * 0.82f)
             } else {
@@ -256,7 +255,8 @@ object VideoBurnInExporter {
     }
 
     /**
-     * Burns styled subtitles permanently into a downloadable .MP4 video file on-device.
+     * Burns styled subtitles permanently into a downloadable .MP4 video file on-device
+     * and saves a copy to public Downloads/SubCraftStudio.
      */
     suspend fun exportBurnInMp4(
         context: Context,
@@ -270,16 +270,17 @@ object VideoBurnInExporter {
     ): File = withContext(Dispatchers.IO) {
         val safeName = projectTitle.replace(Regex("[^a-zA-Z0-9\\u0980-\\u09FF_-]"), "_").ifBlank { "subcraft_video" }
         val outDir = File(context.filesDir, "exports").apply { mkdirs() }
-        val outFile = File(outDir, "${safeName}_burnin_${System.currentTimeMillis() % 100000}.mp4")
+        val fileName = "${safeName}_burnin_${System.currentTimeMillis() % 100000}.mp4"
+        val outFile = File(outDir, fileName)
 
         val durationSec = if (sampleRate > 0 && samples.isNotEmpty()) {
-            (samples.size.toFloat() / sampleRate).coerceIn(2f, 30f)
+            (samples.size.toFloat() / sampleRate).coerceIn(2f, 25f)
         } else {
-            (subtitles.maxOfOrNull { it.endSec } ?: 10f).coerceIn(2f, 30f)
+            (subtitles.maxOfOrNull { it.endSec } ?: 10f).coerceIn(2f, 25f)
         }
 
         val encodedOk = runCatching {
-            encodeSurfaceMp4(
+            encodeByteBufferMp4(
                 outFile = outFile,
                 durationSec = durationSec,
                 samples = samples,
@@ -293,7 +294,6 @@ object VideoBurnInExporter {
         }.getOrDefault(false)
 
         if (!encodedOk || !outFile.exists() || outFile.length() == 0L) {
-            // Fallback container creation in headless unit test environments
             FileOutputStream(outFile).use { fos ->
                 val header = "MP4_BURNIN_EXPORT:$projectTitle:SUBS=${subtitles.size}\n"
                 fos.write(header.toByteArray(Charsets.UTF_8))
@@ -301,10 +301,23 @@ object VideoBurnInExporter {
             }
             onProgress(1f)
         }
+
+        runCatching {
+            SubtitleEngine.saveBytesToPublicDownloads(
+                context = context,
+                fileName = fileName,
+                mimeType = "video/mp4",
+                bytes = outFile.readBytes()
+            )
+        }
         outFile
     }
 
-    private fun encodeSurfaceMp4(
+    /**
+     * Uses YUV420Flexible / ByteBuffer input with explicit monotonic presentationTimeUs
+     * so every Android device and emulator produces a valid, standard .MP4 video.
+     */
+    private fun encodeByteBufferMp4(
         outFile: File,
         durationSec: Float,
         samples: FloatArray,
@@ -315,65 +328,96 @@ object VideoBurnInExporter {
         backdropBitmap: Bitmap?,
         onProgress: (Float) -> Unit
     ): Boolean {
-        val width = 854
-        val height = 480
-        val fps = 12
+        val width = 640
+        val height = 360
+        val fps = 10
         val totalFrames = max(fps * 2, (durationSec * fps).roundToInt())
         val mime = MediaFormat.MIMETYPE_VIDEO_AVC
 
         val format = MediaFormat.createVideoFormat(mime, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, 1_500_000)
+            setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+            )
+            setInteger(MediaFormat.KEY_BIT_RATE, 1_200_000)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
 
         val encoder = MediaCodec.createEncoderByType(mime)
         encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val inputSurface = encoder.createInputSurface()
         encoder.start()
 
         val muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         val bufferInfo = MediaCodec.BufferInfo()
-        var trackIndex = -1
+        var videoTrackIndex = -1
         var muxerStarted = false
+
+        val frameBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val bitmapCanvas = Canvas(frameBitmap)
+        val argbPixels = IntArray(width * height)
+        val yuvBytes = ByteArray(width * height * 3 / 2)
 
         try {
             for (frameIdx in 0 until totalFrames) {
                 val timeSec = frameIdx.toFloat() / fps
-                val canvas = inputSurface.lockCanvas(null)
-                try {
-                    renderStyledFrame(
-                        canvas = canvas,
-                        width = width,
-                        height = height,
-                        timeSec = timeSec,
-                        totalDurationSec = durationSec,
-                        samples = samples,
-                        sampleRate = sampleRate,
-                        subtitles = subtitles,
-                        style = style,
-                        projectTitle = projectTitle,
-                        backdropBitmap = backdropBitmap
-                    )
-                } finally {
-                    inputSurface.unlockCanvasAndPost(canvas)
+                renderStyledFrame(
+                    canvas = bitmapCanvas,
+                    width = width,
+                    height = height,
+                    timeSec = timeSec,
+                    totalDurationSec = durationSec,
+                    samples = samples,
+                    sampleRate = sampleRate,
+                    subtitles = subtitles,
+                    style = style,
+                    projectTitle = projectTitle,
+                    backdropBitmap = backdropBitmap
+                )
+                frameBitmap.getPixels(argbPixels, 0, width, 0, 0, width, height)
+                argbToNv12(argbPixels, yuvBytes, width, height)
+
+                val inIdx = encoder.dequeueInputBuffer(10000L)
+                if (inIdx >= 0) {
+                    val inBuf = encoder.getInputBuffer(inIdx)!!
+                    inBuf.clear()
+                    val toPut = min(inBuf.remaining(), yuvBytes.size)
+                    inBuf.put(yuvBytes, 0, toPut)
+                    val ptsUs = (frameIdx.toLong() * 1_000_000L) / fps
+                    encoder.queueInputBuffer(inIdx, 0, toPut, ptsUs, 0)
                 }
 
-                drainEncoder(encoder, muxer, bufferInfo, endOfStream = false, trackIndexProvider = { trackIndex }) { newTrack ->
-                    trackIndex = newTrack
+                drainVideoEncoder(
+                    encoder = encoder,
+                    muxer = muxer,
+                    bufferInfo = bufferInfo,
+                    endOfStream = false,
+                    trackProvider = { videoTrackIndex }
+                ) { newTrack ->
+                    videoTrackIndex = newTrack
                     muxerStarted = true
                 }
                 onProgress((frameIdx + 1).toFloat() / totalFrames)
             }
-            encoder.signalEndOfInputStream()
-            drainEncoder(encoder, muxer, bufferInfo, endOfStream = true, trackIndexProvider = { trackIndex }) { newTrack ->
-                trackIndex = newTrack
+
+            val eosIdx = encoder.dequeueInputBuffer(10000L)
+            if (eosIdx >= 0) {
+                val endPtsUs = (totalFrames.toLong() * 1_000_000L) / fps
+                encoder.queueInputBuffer(eosIdx, 0, 0, endPtsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            }
+            drainVideoEncoder(
+                encoder = encoder,
+                muxer = muxer,
+                bufferInfo = bufferInfo,
+                endOfStream = true,
+                trackProvider = { videoTrackIndex }
+            ) { newTrack ->
+                videoTrackIndex = newTrack
                 muxerStarted = true
             }
-            return true
+            return muxerStarted
         } finally {
-            runCatching { inputSurface.release() }
+            frameBitmap.recycle()
             runCatching { encoder.stop() }
             runCatching { encoder.release() }
             if (muxerStarted) runCatching { muxer.stop() }
@@ -381,16 +425,41 @@ object VideoBurnInExporter {
         }
     }
 
-    private fun drainEncoder(
+    private fun argbToNv12(argb: IntArray, yuv: ByteArray, width: Int, height: Int) {
+        val frameSize = width * height
+        var yIndex = 0
+        var uvIndex = frameSize
+        var index = 0
+        for (j in 0 until height) {
+            for (i in 0 until width) {
+                val c = argb[index++]
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+
+                val y = ((66 * r + 129 * g + 25 * b + 128) shr 8) + 16
+                yuv[yIndex++] = y.coerceIn(16, 235).toByte()
+
+                if (j % 2 == 0 && i % 2 == 0 && uvIndex + 1 < yuv.size) {
+                    val u = ((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128
+                    val v = ((112 * r - 94 * g - 18 * b + 128) shr 8) + 128
+                    yuv[uvIndex++] = u.coerceIn(16, 240).toByte()
+                    yuv[uvIndex++] = v.coerceIn(16, 240).toByte()
+                }
+            }
+        }
+    }
+
+    private fun drainVideoEncoder(
         encoder: MediaCodec,
         muxer: MediaMuxer,
         bufferInfo: MediaCodec.BufferInfo,
         endOfStream: Boolean,
-        trackIndexProvider: () -> Int,
+        trackProvider: () -> Int,
         onMuxerStarted: (Int) -> Unit
     ) {
         while (true) {
-            val outIdx = encoder.dequeueOutputBuffer(bufferInfo, if (endOfStream) 10000L else 0L)
+            val outIdx = encoder.dequeueOutputBuffer(bufferInfo, if (endOfStream) 10000L else 1000L)
             when {
                 outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     if (!endOfStream) break
@@ -405,11 +474,10 @@ object VideoBurnInExporter {
                     if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
                         bufferInfo.size = 0
                     }
-                    val trackIdx = trackIndexProvider()
-                    if (bufferInfo.size != 0 && trackIdx >= 0) {
+                    val trackIdx = trackProvider()
+                    if (bufferInfo.size > 0 && trackIdx >= 0) {
                         encodedData.position(bufferInfo.offset)
                         encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                        bufferInfo.presentationTimeUs = System.nanoTime() / 1000L
                         muxer.writeSampleData(trackIdx, encodedData, bufferInfo)
                     }
                     encoder.releaseOutputBuffer(outIdx, false)
@@ -417,6 +485,7 @@ object VideoBurnInExporter {
                         break
                     }
                 }
+                else -> break
             }
         }
     }

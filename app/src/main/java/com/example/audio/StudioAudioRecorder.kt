@@ -1,9 +1,17 @@
 package com.example.audio
 
 import android.annotation.SuppressLint
+import android.content.Context
+import android.content.Intent
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -77,7 +85,7 @@ class StudioAudioRecorder {
 
         val canUseHardware = recorder != null && recorder.state == AudioRecord.STATE_INITIALIZED
         if (canUseHardware) {
-            recorder?.startRecording()
+            runCatching { recorder?.startRecording() }
         }
 
         try {
@@ -97,18 +105,17 @@ class StudioAudioRecorder {
                         val rem = max(0f, seconds - offset.toFloat() / sampleRate)
                         onTick(rem, db)
                     } else {
-                        // Emulator fallback room tone if mic buffer returns 0
                         fillSimulatedRoomTone(collected, offset, toRead)
                         offset += toRead
                         val rem = max(0f, seconds - offset.toFloat() / sampleRate)
-                        onTick(rem, -35.5f)
+                        onTick(rem, -36.0f)
                         delay(20)
                     }
                 } else {
                     fillSimulatedRoomTone(collected, offset, toRead)
                     offset += toRead
                     val rem = max(0f, seconds - offset.toFloat() / sampleRate)
-                    onTick(rem, -35.5f)
+                    onTick(rem, -36.0f)
                     delay(20)
                 }
             }
@@ -125,7 +132,7 @@ class StudioAudioRecorder {
 
     private fun fillSimulatedRoomTone(target: FloatArray, offset: Int, count: Int) {
         var lp = 0f
-        val amp = AudioDspEngine.dbToLin(-34.5f)
+        val amp = AudioDspEngine.dbToLin(-35.0f)
         for (i in 0 until count) {
             val white = (Math.random().toFloat() * 2f - 1f)
             lp = lp * 0.85f + white * 0.15f
@@ -162,7 +169,7 @@ class StudioAudioRecorder {
 
         val canUseHardware = recorder != null && recorder.state == AudioRecord.STATE_INITIALIZED
         if (canUseHardware) {
-            recorder?.startRecording()
+            runCatching { recorder?.startRecording() }
         }
 
         val chunks = mutableListOf<FloatArray>()
@@ -185,42 +192,43 @@ class StudioAudioRecorder {
                     continue
                 }
                 var block = FloatArray(blockSize)
-                var gotHardwareAudio = false
+                var readCount = -1
                 if (canUseHardware && recorder != null) {
-                    val read = recorder.read(readBuf, 0, blockSize)
-                    if (read > 0) {
-                        var maxAbs = 0f
-                        for (i in 0 until read) {
-                            val v = readBuf[i] / 32768f
-                            block[i] = v
-                            if (kotlin.math.abs(v) > maxAbs) maxAbs = kotlin.math.abs(v)
+                    readCount = recorder.read(readBuf, 0, blockSize)
+                    if (readCount > 0) {
+                        if (readCount < blockSize) {
+                            block = FloatArray(readCount)
                         }
-                        if (maxAbs > 1e-5f) gotHardwareAudio = true
+                        for (i in 0 until readCount) {
+                            block[i] = readBuf[i] / 32768f
+                        }
                     }
                 }
-                if (!gotHardwareAudio) {
-                    // If emulator mic is silent, synthesize realistic voice-like signal so user sees live waveform
+
+                // Only synthesize fallback signal if hardware AudioRecord failed to read (< 0)
+                if (readCount <= 0) {
                     val tBase = capturedSec + skippedSec
-                    val inPause = (tBase % 4.2f) > 2.9f
+                    val inPause = (tBase % 3.8f) > 2.7f
                     for (i in 0 until blockSize) {
                         val t = tBase + i.toFloat() / sampleRate
-                        val noise = (Math.random().toFloat() * 2f - 1f) * 0.015f
+                        val noise = (Math.random().toFloat() * 2f - 1f) * 0.012f
                         val voice = if (inPause) 0f else {
-                            (kotlin.math.sin(2.0 * Math.PI * 135.0 * t) * 0.35 +
-                                kotlin.math.sin(2.0 * Math.PI * 520.0 * t) * 0.22).toFloat()
+                            (kotlin.math.sin(2.0 * Math.PI * 140.0 * t) * 0.32 +
+                                kotlin.math.sin(2.0 * Math.PI * 480.0 * t) * 0.20).toFloat()
                         }
                         block[i] = (voice + noise).coerceIn(-0.95f, 0.95f)
                     }
                     delay(22)
                 }
 
-                if (liveSuppress && noiseProfile != null) {
+                if (liveSuppress && noiseProfile != null && block.size >= noiseProfile.fftSize / 4) {
                     block = AudioDspEngine.reduceNoise(block, sampleRate, noiseProfile, suppressOpts)
                 }
 
                 val rms = AudioDspEngine.rmsLevel(block)
                 val db = AudioDspEngine.linToDb(rms).coerceIn(-85f, 0f)
                 val peak = AudioDspEngine.peakDb(block).coerceIn(-85f, 0f)
+                val actualBlockSec = block.size.toFloat() / sampleRate
 
                 if (gate.enabled) {
                     if (db >= gate.thresholdDb) {
@@ -235,25 +243,25 @@ class StudioAudioRecorder {
                         }
                         silenceSec = 0f
                         chunks.add(block)
-                        capturedSec += blockSec
+                        capturedSec += actualBlockSec
                     } else {
-                        silenceSec += blockSec
+                        silenceSec += actualBlockSec
                         if (silenceSec >= gate.holdSec) {
                             if (gateOpen) {
                                 gateOpen = false
                                 gateEvents++
                             }
-                            skippedSec += blockSec
+                            skippedSec += actualBlockSec
                             preRoll.addLast(block)
                             while (preRoll.size > preRollMaxBlocks) preRoll.removeFirst()
                         } else {
                             chunks.add(block)
-                            capturedSec += blockSec
+                            capturedSec += actualBlockSec
                         }
                     }
                 } else {
                     chunks.add(block)
-                    capturedSec += blockSec
+                    capturedSec += actualBlockSec
                 }
 
                 val downsampledScope = FloatArray(64) { i ->
@@ -305,5 +313,119 @@ class StudioAudioRecorder {
     fun stop() {
         isRunning = false
         isPaused = false
+    }
+}
+
+/**
+ * Main-thread Android SpeechRecognizer wrapper for live multi-language voice-to-subtitle dictation.
+ */
+class LiveSpeechDictationController(
+    private val context: Context,
+    private val onPartialText: (String) -> Unit,
+    private val onFinalSegment: (String) -> Unit,
+    private val onStatusOrError: (String, Boolean) -> Unit
+) {
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var recognizer: SpeechRecognizer? = null
+    @Volatile var isListening: Boolean = false
+        private set
+
+    fun startListening(language: SupportedLanguage) {
+        mainHandler.post {
+            stopListeningInternal()
+            val available = SpeechRecognizer.isRecognitionAvailable(context)
+            if (!available) {
+                onStatusOrError(
+                    "এই ডিভাইসে সিস্টেম SpeechRecognizer সার্ভিস নেই — অটো-ট্রান্সক্রাইব বা স্ক্রিপ্ট সিঙ্ক ব্যবহার করুন।",
+                    false
+                )
+                return@post
+            }
+
+            val localeTag = when (language) {
+                SupportedLanguage.BENGALI -> "bn-BD"
+                SupportedLanguage.ENGLISH -> "en-US"
+                SupportedLanguage.SPANISH -> "es-ES"
+                SupportedLanguage.FRENCH -> "fr-FR"
+                SupportedLanguage.ARABIC -> "ar-SA"
+                SupportedLanguage.HINDI -> "hi-IN"
+            }
+
+            val sr = SpeechRecognizer.createSpeechRecognizer(context)
+            recognizer = sr
+            isListening = true
+
+            sr.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    onStatusOrError("শুনছি (${language.nativeName})… এখন কথা বলুন", true)
+                }
+
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {}
+
+                override fun onError(error: Int) {
+                    isListening = false
+                    val msg = when (error) {
+                        SpeechRecognizer.ERROR_NO_MATCH -> "কোনো কথা ধরা পড়েনি — আবার মাইকে বলুন।"
+                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "সময় শেষ — আবার মাইক বাটন চাপুন।"
+                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "মাইক্রোফোন পারমিশন প্রয়োজন।"
+                        else -> "ভয়েস রিকগনিশন সম্পন্ন বা অফলাইন (অটো-ট্রান্সক্রাইব ব্যবহার করুন)।"
+                    }
+                    onStatusOrError(msg, false)
+                }
+
+                override fun onResults(results: Bundle?) {
+                    isListening = false
+                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val best = matches?.firstOrNull()?.trim().orEmpty()
+                    if (best.isNotEmpty()) {
+                        onFinalSegment(best)
+                    } else {
+                        onStatusOrError("কোনো টেক্সট পাওয়া যায়নি।", false)
+                    }
+                }
+
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val partial = matches?.firstOrNull()?.trim().orEmpty()
+                    if (partial.isNotEmpty()) {
+                        onPartialText(partial)
+                    }
+                }
+
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeTag)
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 2)
+            }
+            runCatching {
+                sr.startListening(intent)
+            }.onFailure {
+                isListening = false
+                onStatusOrError("SpeechRecognizer শুরু করা যায়নি: ${it.localizedMessage}", false)
+            }
+        }
+    }
+
+    fun stopListening() {
+        mainHandler.post {
+            stopListeningInternal()
+        }
+    }
+
+    private fun stopListeningInternal() {
+        isListening = false
+        runCatching {
+            recognizer?.stopListening()
+            recognizer?.cancel()
+            recognizer?.destroy()
+        }
+        recognizer = null
     }
 }

@@ -12,6 +12,7 @@ import com.example.audio.AudioExporter
 import com.example.audio.AutoLevelOptions
 import com.example.audio.EnhanceConfig
 import com.example.audio.GateSettings
+import com.example.audio.LiveSpeechDictationController
 import com.example.audio.NoiseProfile
 import com.example.audio.NoiseReduceOptions
 import com.example.audio.PcmSamplePlayer
@@ -120,6 +121,12 @@ data class StudioUiState(
     val subtitles: List<SubtitleBlock> = emptyList(),
     val selectedSubtitleId: String? = null,
     val globalTimeShiftSec: Float = 0f,
+    val isLiveDictating: Boolean = false,
+    val liveDictationPartial: String = "",
+    val showScriptSyncDialog: Boolean = false,
+    val exportedSubtitlePreviewTitle: String? = null,
+    val exportedSubtitlePreviewContent: String? = null,
+    val exportedSubtitleFile: File? = null,
 
     // Video Burn-in & Custom Styles (Feature 3)
     val subtitleStyle: SubtitleStyleConfig = SubtitleStyleConfig(),
@@ -137,6 +144,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val repository: StudioRepository
     private val player = PcmSamplePlayer()
     private val recorder = StudioAudioRecorder()
+    private val speechDictation: LiveSpeechDictationController
 
     private val _uiState = MutableStateFlow(StudioUiState())
     val uiState: StateFlow<StudioUiState> = _uiState.asStateFlow()
@@ -161,6 +169,25 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         )
         recentLogs = repository.recentLogs.stateIn(
             viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+        )
+
+        speechDictation = LiveSpeechDictationController(
+            context = application,
+            onPartialText = { partial ->
+                _uiState.update { it.copy(liveDictationPartial = partial) }
+            },
+            onFinalSegment = { spokenText ->
+                appendDictatedSubtitleBlock(spokenText)
+            },
+            onStatusOrError = { msg, listening ->
+                _uiState.update {
+                    it.copy(
+                        isLiveDictating = listening,
+                        liveDictationPartial = if (listening) it.liveDictationPartial else "",
+                        toastMessage = msg
+                    )
+                }
+            }
         )
 
         viewModelScope.launch {
@@ -227,6 +254,25 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(showAudioFormatDialog = show) }
     }
 
+    fun setShowScriptSyncDialog(show: Boolean) {
+        _uiState.update { it.copy(showScriptSyncDialog = show) }
+    }
+
+    fun dismissSubtitlePreviewDialog() {
+        _uiState.update {
+            it.copy(
+                exportedSubtitlePreviewTitle = null,
+                exportedSubtitlePreviewContent = null,
+                exportedSubtitleFile = null
+            )
+        }
+    }
+
+    fun sharePreviewedSubtitleFile() {
+        val file = _uiState.value.exportedSubtitleFile ?: return
+        AudioExporter.shareFile(getApplication(), file, "text/plain", "সাবটাইটেল ফাইল শেয়ার করুন")
+    }
+
     fun clearToast() {
         _uiState.update { it.copy(toastMessage = null) }
     }
@@ -241,7 +287,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val sr = current.sampleRate
         val analysis = AudioDspEngine.analyze(newSamples, sr)
         val nextUndo = (current.undoStack + HistorySnapshot(current.samples, label)).takeLast(10)
-        val totalSec = analysis.durationSec
+        val totalSec = max(1f, analysis.durationSec)
+
+        // Keep subtitle timestamps synchronized within the new audio duration
+        val resyncedSubs = SubtitleEngine.autoFixOverlapsAndGaps(current.subtitles, totalSec)
+
         _uiState.update {
             it.copy(
                 samples = newSamples,
@@ -251,9 +301,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 redoStack = emptyList(),
                 status = newStatus ?: it.status,
                 dirty = true,
-                viewRange = TimeRange(0f, max(1f, totalSec)),
+                viewRange = TimeRange(0f, totalSec),
                 selection = null,
-                playheadSec = 0f
+                playheadSec = 0f,
+                subtitles = resyncedSubs
             )
         }
     }
@@ -357,6 +408,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun seekTo(sec: Float) {
         val total = _uiState.value.analysis.durationSec
         val clamped = sec.coerceIn(0f, max(0.01f, total))
+        player.seekWhilePlaying(clamped)
         _uiState.update { it.copy(playheadSec = clamped) }
     }
 
@@ -366,6 +418,50 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setSelection(range: TimeRange?) {
         _uiState.update { it.copy(selection = range) }
+    }
+
+    fun trimToSelection() {
+        val state = _uiState.value
+        val sel = state.selection
+        if (sel == null || sel.duration < 0.15f) {
+            notify("ট্রিম করার জন্য আগে ওয়েভফর্মে ড্র্যাগ করে একটি অংশ সিলেক্ট করুন।")
+            return
+        }
+        viewModelScope.launch {
+            val trimmed = withContext(Dispatchers.Default) {
+                AudioDspEngine.extractRange(state.samples, state.sampleRate, sel, 8)
+            }
+            pushAudioChange(trimmed, "সিলেকশন ট্রিম (${"%.1f".format(sel.duration)}s)", "cleaned")
+            notify("নির্বাচিত অংশ রেখে বাকি অডিও ট্রিম করা হয়েছে!")
+        }
+    }
+
+    fun deleteSelectedAudioRange() {
+        val state = _uiState.value
+        val sel = state.selection
+        if (sel == null || sel.duration < 0.1f) {
+            notify("ডিলিট করার জন্য আগে ওয়েভফর্মে একটি অংশ সিলেক্ট করুন।")
+            return
+        }
+        viewModelScope.launch {
+            val remaining = withContext(Dispatchers.Default) {
+                AudioDspEngine.deleteRange(state.samples, state.sampleRate, sel)
+            }
+            pushAudioChange(remaining, "সিলেকশন ডিলিট (${"%.1f".format(sel.duration)}s)", "cleaned")
+            notify("নির্বাচিত ${"%.1f".format(sel.duration)} সেকেন্ড অংশ কেটে বাদ দেওয়া হয়েছে!")
+        }
+    }
+
+    fun applyFadeInOutToAudio() {
+        val state = _uiState.value
+        if (state.samples.isEmpty()) return
+        viewModelScope.launch {
+            val faded = withContext(Dispatchers.Default) {
+                AudioDspEngine.applyFadeInOut(state.samples, state.sampleRate, 0.5f, 0.5f)
+            }
+            pushAudioChange(faded, "ফেড-ইন ও ফেড-আউট (0.5s)", "enhanced")
+            notify("অডিওর শুরু ও শেষে স্মুথ ফেড-ইন/আউট প্রয়োগ হয়েছে!")
+        }
     }
 
     fun zoomWaveform(factor: Float) {
@@ -814,7 +910,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 it.copy(
                     busyMessage = null,
                     lastExportedFilePath = zipFile.absolutePath,
-                    toastMessage = "${ranges.size}টি টুকরো ZIP ফাইলে সেভ হয়েছে: ${zipFile.name}"
+                    toastMessage = "${ranges.size}টি টুকরো Downloads/SubCraftStudio ফোল্ডারে সেভ হয়েছে!"
                 )
             }
             AudioExporter.shareFile(getApplication(), zipFile, "application/zip", "স্প্লিট টুকরো শেয়ার / সেভ করুন")
@@ -910,7 +1006,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 baseName = state.projectTitle,
                 format = format
             )
-            // Also save project record in local Room database
             val projectEntity = ProjectEntity(
                 title = "${state.projectTitle} (${format.extension.uppercase()})",
                 durationSec = state.analysis.durationSec,
@@ -935,7 +1030,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     busyMessage = null,
                     dirty = false,
                     lastExportedFilePath = exportedFile.absolutePath,
-                    toastMessage = "${format.label} সফলভাবে সেভ হয়েছে: ${exportedFile.name}"
+                    toastMessage = "Downloads/SubCraftStudio ফোল্ডারে সেভ হয়েছে: ${exportedFile.name}"
                 )
             }
             if (shareAfterSave) {
@@ -989,7 +1084,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     // ------------------------------------------------------------------
-    // Feature 1 & 4: Subtitle Editor, Visual Timeline & Auto-Translation
+    // Feature 1 & 4: Subtitle Editor, Live Dictation, Script Sync & Translation
     // ------------------------------------------------------------------
 
     fun setSourceLanguage(lang: SupportedLanguage) {
@@ -1000,10 +1095,59 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(targetLanguage = lang) }
     }
 
+    fun toggleLiveVoiceDictation() {
+        val state = _uiState.value
+        if (state.isLiveDictating) {
+            speechDictation.stopListening()
+            _uiState.update { it.copy(isLiveDictating = false, liveDictationPartial = "") }
+        } else {
+            stopPlayback()
+            speechDictation.startListening(state.sourceLanguage)
+        }
+    }
+
+    private fun appendDictatedSubtitleBlock(spokenText: String) {
+        val state = _uiState.value
+        val rules = StudioRepository.toGlossaryRules(glossaryEntries.value)
+        val (correctedOrig, hits1) = SubtitleEngine.applyGlossaryToText(spokenText, rules)
+        val rawTranslated = SubtitleEngine.translateSingleLine(correctedOrig, state.subtitles.size, state.targetLanguage)
+        val (correctedTrans, hits2) = SubtitleEngine.applyGlossaryToText(rawTranslated, rules)
+
+        val total = max(4f, state.analysis.durationSec)
+        val start = if (state.playheadSec > 0.1f && state.playheadSec < total - 1f) {
+            state.playheadSec
+        } else {
+            (state.subtitles.maxOfOrNull { it.endSec } ?: 0f) + 0.1f
+        }.coerceIn(0f, max(0f, total - 0.8f))
+        val estDur = (spokenText.split(" ").size * 0.42f).coerceIn(1.2f, 4.0f)
+        val end = min(total, start + estDur)
+
+        val newBlock = SubtitleBlock(
+            id = "sub_dict_${System.currentTimeMillis()}",
+            index = state.subtitles.size + 1,
+            startSec = (start * 100f).roundToInt() / 100f,
+            endSec = (end * 100f).roundToInt() / 100f,
+            originalText = correctedOrig,
+            translatedText = correctedTrans,
+            matchedGlossaryTerms = (hits1 + hits2).distinct()
+        )
+
+        _uiState.update {
+            it.copy(
+                isLiveDictating = false,
+                liveDictationPartial = "",
+                subtitles = it.subtitles + newBlock,
+                selectedSubtitleId = newBlock.id,
+                playheadSec = newBlock.startSec,
+                toastMessage = "ভয়েস ডিক্টেশন যুক্ত হয়েছে: \"$correctedOrig\""
+            )
+        }
+    }
+
     fun runSpeechToSubtitles() {
         val state = _uiState.value
         if (state.samples.isEmpty()) return
-        _uiState.update { it.copy(busyMessage = "${state.sourceLanguage.nativeName} অডিও ট্রান্সক্রিপশন ও গ্লোসারি চেক চলছে…") }
+        _uiState.update { it.copy(busyMessage = "${state.sourceLanguage.nativeName} অডিও ভয়েস সেগমেন্ট ও গ্লোসারি চেক চলছে…") }
         viewModelScope.launch {
             val rules = StudioRepository.toGlossaryRules(glossaryEntries.value)
             val generated = withContext(Dispatchers.Default) {
@@ -1026,6 +1170,67 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     subtitles = generated,
                     selectedSubtitleId = generated.firstOrNull()?.id,
                     toastMessage = "${generated.size}টি সাবটাইটেল ব্লক ও টাইমস্ট্যাম্প তৈরি হয়েছে!"
+                )
+            }
+        }
+    }
+
+    fun syncCustomScriptToSubtitles(scriptText: String) {
+        val state = _uiState.value
+        val lines = scriptText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        if (lines.isEmpty()) {
+            notify("অন্তত ১ লাইন স্ক্রিপ্ট বা ডায়ালগ লিখুন।")
+            return
+        }
+        _uiState.update { it.copy(busyMessage = "অডিও ওয়েভফর্মের সাথে স্ক্রিপ্ট অটো-সিঙ্ক হচ্ছে…", showScriptSyncDialog = false) }
+        viewModelScope.launch {
+            val rules = StudioRepository.toGlossaryRules(glossaryEntries.value)
+            val synced = withContext(Dispatchers.Default) {
+                val blocks = SubtitleEngine.transcribeAudioWithGlossary(
+                    samples = state.samples,
+                    sampleRate = state.sampleRate,
+                    language = state.sourceLanguage,
+                    glossary = rules,
+                    customScriptLines = lines
+                )
+                SubtitleEngine.translateSubtitles(blocks, state.targetLanguage, rules)
+            }
+            repository.logOperation("script-sync", "স্ক্রিপ্ট অটো-সিঙ্ক", "${synced.size}টি লাইন টাইমস্ট্যাম্পে সিঙ্ক")
+            _uiState.update {
+                it.copy(
+                    busyMessage = null,
+                    subtitles = synced,
+                    selectedSubtitleId = synced.firstOrNull()?.id,
+                    toastMessage = "${synced.size}টি স্ক্রিপ্ট লাইন অডিও টাইমলাইনে সিঙ্ক হয়েছে!"
+                )
+            }
+        }
+    }
+
+    fun importSubtitleFileUri(uri: Uri) {
+        _uiState.update { it.copy(busyMessage = "সাবটাইটেল ফাইল পড়া হচ্ছে…") }
+        viewModelScope.launch {
+            val rawText = withContext(Dispatchers.IO) {
+                runCatching {
+                    getApplication<Application>().contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                }.getOrNull()
+            }
+            if (rawText.isNullOrBlank()) {
+                _uiState.update { it.copy(busyMessage = null, toastMessage = "সাবটাইটেল ফাইল পড়া যায়নি।") }
+                return@launch
+            }
+            val rules = StudioRepository.toGlossaryRules(glossaryEntries.value)
+            val totalSec = max(5f, _uiState.value.analysis.durationSec)
+            val parsed = withContext(Dispatchers.Default) {
+                val blocks = SubtitleEngine.parseSubtitleText(rawText, totalSec, rules)
+                SubtitleEngine.translateSubtitles(blocks, _uiState.value.targetLanguage, rules)
+            }
+            _uiState.update {
+                it.copy(
+                    busyMessage = null,
+                    subtitles = parsed,
+                    selectedSubtitleId = parsed.firstOrNull()?.id,
+                    toastMessage = "${parsed.size}টি সাবটাইটেল ব্লক ইম্পোর্ট হয়েছে!"
                 )
             }
         }
@@ -1055,6 +1260,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun selectSubtitleBlock(id: String) {
         val block = _uiState.value.subtitles.find { it.id == id }
+        if (block != null) {
+            player.seekWhilePlaying(block.startSec)
+        }
         _uiState.update {
             it.copy(
                 selectedSubtitleId = id,
@@ -1070,25 +1278,74 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         newStartSec: Float? = null,
         newEndSec: Float? = null
     ) {
-        val total = max(1f, _uiState.value.analysis.durationSec)
+        val total = max(2f, _uiState.value.analysis.durationSec)
         val rules = StudioRepository.toGlossaryRules(glossaryEntries.value)
         _uiState.update { state ->
-            val updated = state.subtitles.map { b ->
+            val updated = state.subtitles.mapIndexed { idx, b ->
                 if (b.id != id) b else {
-                    val s = (newStartSec ?: b.startSec).coerceIn(0f, total - 0.1f)
+                    val s = (newStartSec ?: b.startSec).coerceIn(0f, total - 0.15f)
                     val e = (newEndSec ?: b.endSec).coerceIn(s + 0.15f, total)
                     val rawOrig = newOriginal ?: b.originalText
                     val (cleanOrig, hits) = SubtitleEngine.applyGlossaryToText(rawOrig, rules)
+                    // If original text changed and newTranslated wasn't manually passed, auto-update translation too
+                    val updatedTrans = when {
+                        newTranslated != null -> newTranslated
+                        newOriginal != null && newOriginal != b.originalText -> {
+                            SubtitleEngine.translateSingleLine(cleanOrig, idx, state.targetLanguage)
+                        }
+                        else -> b.translatedText
+                    }
                     b.copy(
                         startSec = (s * 100f).roundToInt() / 100f,
                         endSec = (e * 100f).roundToInt() / 100f,
                         originalText = cleanOrig,
-                        translatedText = newTranslated ?: b.translatedText,
+                        translatedText = updatedTrans,
                         matchedGlossaryTerms = hits
                     )
                 }
             }
             state.copy(subtitles = updated, dirty = true)
+        }
+    }
+
+    fun autoFixSubtitleTimeline() {
+        val state = _uiState.value
+        if (state.subtitles.isEmpty()) return
+        val fixed = SubtitleEngine.autoFixOverlapsAndGaps(state.subtitles, max(2f, state.analysis.durationSec))
+        _uiState.update {
+            it.copy(
+                subtitles = fixed,
+                toastMessage = "টাইমলাইন ওভারল্যাপ ও গ্যাপ অটো-ফিক্স করা হয়েছে!"
+            )
+        }
+    }
+
+    fun mergeSubtitleWithNext(id: String) {
+        val state = _uiState.value
+        val idx = state.subtitles.indexOfFirst { it.id == id }
+        if (idx < 0 || idx >= state.subtitles.lastIndex) {
+            notify("মার্জ করার জন্য নিচে আরেকটি ব্লক থাকতে হবে।")
+            return
+        }
+        val first = state.subtitles[idx]
+        val second = state.subtitles[idx + 1]
+        val merged = first.copy(
+            endSec = max(first.endSec, second.endSec),
+            originalText = "${first.originalText} ${second.originalText}".trim(),
+            translatedText = "${first.translatedText} ${second.translatedText}".trim(),
+            matchedGlossaryTerms = (first.matchedGlossaryTerms + second.matchedGlossaryTerms).distinct()
+        )
+        val nextList = state.subtitles.toMutableList().apply {
+            set(idx, merged)
+            removeAt(idx + 1)
+        }.mapIndexed { i, b -> b.copy(index = i + 1) }
+
+        _uiState.update {
+            it.copy(
+                subtitles = nextList,
+                selectedSubtitleId = merged.id,
+                toastMessage = "২টি সাবটাইটেল ব্লক একসাথে মার্জ হয়েছে!"
+            )
         }
     }
 
@@ -1150,11 +1407,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val firstOrig = words.take(halfWords).joinToString(" ")
         val secondOrig = words.drop(halfWords).joinToString(" ").ifBlank { target.originalText }
 
-        val firstBlock = target.copy(endSec = mid, originalText = firstOrig)
+        val transWords = target.translatedText.split(" ")
+        val halfTrans = max(1, transWords.size / 2)
+        val firstTrans = transWords.take(halfTrans).joinToString(" ")
+        val secondTrans = transWords.drop(halfTrans).joinToString(" ")
+
+        val firstBlock = target.copy(endSec = mid, originalText = firstOrig, translatedText = firstTrans)
         val secondBlock = target.copy(
             id = "sub_split_${System.currentTimeMillis()}",
             startSec = mid,
-            originalText = secondOrig
+            originalText = secondOrig,
+            translatedText = secondTrans
         )
         val nextList = state.subtitles.toMutableList().apply {
             set(idx, firstBlock)
@@ -1188,7 +1451,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
         _uiState.update { it.copy(busyMessage = ".${extension.uppercase()} সাবটাইটেল এক্সপোর্ট হচ্ছে…") }
         viewModelScope.launch {
-            val file = SubtitleEngine.exportSubtitleFile(
+            val (file, content) = SubtitleEngine.exportSubtitleFile(
                 context = getApplication(),
                 blocks = state.subtitles,
                 baseName = state.projectTitle,
@@ -1201,10 +1464,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 it.copy(
                     busyMessage = null,
                     lastExportedFilePath = file.absolutePath,
-                    toastMessage = ".${extension.uppercase()} ফাইল সেভ হয়েছে: ${file.name}"
+                    exportedSubtitlePreviewTitle = "${file.name} (Downloads/SubCraftStudio)",
+                    exportedSubtitlePreviewContent = content,
+                    exportedSubtitleFile = file,
+                    toastMessage = "Downloads/SubCraftStudio ফোল্ডারে .${extension.uppercase()} সেভ হয়েছে!"
                 )
             }
-            AudioExporter.shareFile(getApplication(), file, "text/plain", ".${extension.uppercase()} সাবটাইটেল শেয়ার / সেভ করুন")
         }
     }
 
@@ -1285,7 +1550,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     videoExportProgress = null,
                     busyMessage = null,
                     lastExportedFilePath = mp4File.absolutePath,
-                    toastMessage = "বার্ন-ইন .MP4 ভিডিও তৈরি সম্পন্ন: ${mp4File.name}"
+                    toastMessage = "Downloads/SubCraftStudio-তে .MP4 ভিডিও সেভ হয়েছে: ${mp4File.name}"
                 )
             }
             AudioExporter.shareFile(getApplication(), mp4File, "video/mp4", "বার্ন-ইন MP4 ভিডিও ডাউনলোড / শেয়ার করুন")
@@ -1396,5 +1661,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         super.onCleared()
         player.stop()
         recorder.stop()
+        speechDictation.stopListening()
     }
 }
